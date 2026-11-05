@@ -1,4 +1,5 @@
-streamlit>=1.40
 pyserial>=3.5
 pandas>=2.0
 plotly>=5.18
+streamlit>=1.50
+pandas>=2.0

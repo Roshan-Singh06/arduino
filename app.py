@@ -1,372 +1,457 @@
-
 import streamlit as st
-import serial
-import serial.tools.list_ports
-import pandas as pd
-import plotly.express as px
-import time
-from datetime import datetime
 
 st.set_page_config(
-    page_title="Arduino Universal Controller",
-    page_icon="⚙️",
+    page_title="Arduino Universal Control Center",
+    page_icon="🔌",
     layout="wide"
 )
 
-if "ser" not in st.session_state:
-    st.session_state.ser = None
+st.title("🔌 Arduino Universal Control Center")
+st.caption("Browser-based USB serial control | Arduino Uno | 115200 baud")
 
-if "records" not in st.session_state:
-    st.session_state.records = []
-
-if "armed" not in st.session_state:
-    st.session_state.armed = False
-
-if "estop" not in st.session_state:
-    st.session_state.estop = False
-
-if "logs" not in st.session_state:
-    st.session_state.logs = []
-
-if "last_hb" not in st.session_state:
-    st.session_state.last_hb = 0.0
-
-
-def send(cmd):
-    ser = st.session_state.ser
-
-    if ser and ser.is_open:
-        ser.write((cmd + "\n").encode())
-        st.session_state.logs.append(
-            f"TX: {cmd}"
-        )
-        return True
-
-    return False
-
-
-def read_serial():
-
-    ser = st.session_state.ser
-
-    if not ser or not ser.is_open:
-        return
-
-    while ser.in_waiting:
-
-        line = ser.readline().decode(
-            errors="ignore"
-        ).strip()
-
-        if not line:
-            continue
-
-        st.session_state.logs.append(
-            f"RX: {line}"
-        )
-
-        if line == "ACK,ARMED":
-            st.session_state.armed = True
-
-        elif line in ("ACK,DISARMED", "ACK,ESTOP", "ACK,RESET"):
-            st.session_state.armed = False
-
-            if line == "ACK,ESTOP":
-                st.session_state.estop = True
-
-            if line == "ACK,RESET":
-                st.session_state.estop = False
-
-        elif line.startswith("FAULT,"):
-
-            st.session_state.armed = False
-
-            if "WATCHDOG" in line:
-                st.error("Arduino watchdog triggered")
-
-        elif line.startswith("DATA,"):
-
-            v = line.split(",")
-
-            if len(v) == 8:
-                try:
-                    st.session_state.records.append({
-                        "Timestamp": datetime.now().isoformat(),
-                        "Time_ms": int(v[1]),
-                        **{
-                            f"A{i}": int(v[i + 2])
-                            for i in range(6)
-                        }
-                    })
-
-                    st.session_state.records = (
-                        st.session_state.records[-20000:]
-                    )
-
-                except ValueError:
-                    pass
-
-
-st.title("⚙️ Arduino Universal Control Center")
-
-st.caption("Arduino Uno | USB | Digital / Analog / PWM")
-
-# CONNECTION
-st.sidebar.header("USB Connection")
-
-ports = [
-    p.device
-    for p in serial.tools.list_ports.comports()
-]
-
-port = st.sidebar.selectbox(
-    "COM Port",
-    ports if ports else ["No device found"]
+st.info(
+    "Connect your Arduino by USB, then click Connect and select its serial port. "
+    "Use Chrome or Edge on the computer physically connected to the board."
 )
 
-if st.sidebar.button("CONNECT"):
+HTML = """
+<div id="arduino-panel">
+  <div class="topbar">
+    <span id="connection-status">● Disconnected</span>
+    <button id="connect">Connect Arduino</button>
+    <button id="disconnect" disabled>Disconnect</button>
+  </div>
 
-    try:
-        if st.session_state.ser:
-            st.session_state.ser.close()
+  <div class="section">
+    <h3>Safety controls</h3>
+    <button id="arm" disabled>ARM OUTPUTS</button>
+    <button id="disarm" disabled>DISARM</button>
+    <button id="estop" class="danger" disabled>EMERGENCY STOP</button>
+    <button id="reset" disabled>Reset E-STOP</button>
+    <p id="safety-status">Outputs are disarmed.</p>
+  </div>
 
-        st.session_state.ser = serial.Serial(
-            port,
-            115200,
-            timeout=0.02
-        )
+  <div class="section">
+    <h3>Digital pin control</h3>
+    <label>Pin
+      <select id="digital-pin"></select>
+    </label>
+    <button id="set-output" disabled>Configure OUTPUT</button>
+    <button id="set-input" disabled>Configure INPUT</button>
+    <button id="digital-on" disabled>ON</button>
+    <button id="digital-off" disabled>OFF</button>
+  </div>
 
-        time.sleep(2)
-        st.session_state.ser.reset_input_buffer()
+  <div class="section">
+    <h3>PWM control</h3>
+    <label>PWM pin
+      <select id="pwm-pin"></select>
+    </label>
+    <label>Duty value: <b id="pwm-value">0</b> / 255</label>
+    <input id="pwm-slider" type="range" min="0" max="255" value="0">
+    <button id="send-pwm" disabled>Apply PWM</button>
+  </div>
 
-        st.sidebar.success("Connected")
+  <div class="section">
+    <h3>Analog inputs</h3>
+    <div class="analog-grid" id="analog-grid"></div>
+    <canvas id="analog-chart" width="900" height="260"></canvas>
+    <button id="download-csv">Download sensor CSV</button>
+  </div>
 
-    except Exception as e:
-        st.sidebar.error(str(e))
+  <div class="section">
+    <h3>Serial monitor</h3>
+    <pre id="terminal"></pre>
+  </div>
+</div>
+"""
 
+CSS = """
+#arduino-panel {
+  font-family: sans-serif;
+  color: var(--st-text-color);
+}
+#arduino-panel .section {
+  border: 1px solid var(--st-border-color);
+  border-radius: 12px;
+  padding: 16px;
+  margin: 14px 0;
+}
+#arduino-panel .topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+#arduino-panel button {
+  border: 1px solid var(--st-border-color);
+  border-radius: 8px;
+  padding: 9px 13px;
+  margin: 4px;
+  cursor: pointer;
+  color: var(--st-text-color);
+  background: var(--st-secondary-background-color);
+}
+#arduino-panel button:disabled {
+  opacity: .4;
+  cursor: not-allowed;
+}
+#arduino-panel button.danger {
+  background: #a52323;
+  color: white;
+  border-color: #a52323;
+}
+#arduino-panel select {
+  padding: 8px;
+  margin: 6px;
+  border-radius: 6px;
+}
+#arduino-panel input[type=range] {
+  width: min(500px, 90%);
+  display: block;
+  margin: 12px 0;
+}
+#arduino-panel .analog-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(100px, 1fr));
+  gap: 10px;
+  margin: 12px 0;
+}
+#arduino-panel .analog-card {
+  background: var(--st-secondary-background-color);
+  padding: 12px;
+  border-radius: 8px;
+}
+#arduino-panel .analog-card strong {
+  display: block;
+  font-size: 22px;
+  margin-top: 5px;
+}
+#arduino-panel canvas {
+  width: 100%;
+  max-height: 260px;
+  border: 1px solid var(--st-border-color);
+  border-radius: 8px;
+}
+#arduino-panel #terminal {
+  background: #101820;
+  color: #9ee7a1;
+  height: 180px;
+  overflow: auto;
+  padding: 12px;
+  border-radius: 8px;
+  white-space: pre-wrap;
+}
+"""
 
-if st.sidebar.button("DISCONNECT"):
+JS = r"""
+export default function({ parentElement }) {
+  const root = parentElement;
+  const $ = (id) => root.querySelector("#" + id);
 
-    if st.session_state.ser:
-        st.session_state.ser.close()
+  let port = null;
+  let reader = null;
+  let writer = null;
+  let readTask = null;
+  let heartbeatTimer = null;
+  let armed = false;
+  let estop = false;
+  let lineBuffer = "";
+  let writeQueue = Promise.resolve();
+  let history = [];
 
-    st.session_state.ser = None
-    st.session_state.armed = False
+  const pins = Array.from({length: 12}, (_, i) => i + 2);
+  const pwmPins = [3, 5, 6, 9, 10, 11];
 
+  pins.forEach(p => $("digital-pin").add(new Option("D" + p, p)));
+  pwmPins.forEach(p => $("pwm-pin").add(new Option("D" + p, p)));
 
-ser = st.session_state.ser
+  $("analog-grid").innerHTML = Array.from({length: 6}, (_, i) =>
+    `<div class="analog-card">A${i}<strong id="a${i}">---</strong></div>`
+  ).join("");
 
-st.divider()
+  function log(message) {
+    const terminal = $("terminal");
+    terminal.textContent += message + "\n";
+    terminal.scrollTop = terminal.scrollHeight;
+  }
 
-# SAFETY
-st.subheader("Controller Safety")
+  function setStatus(message) {
+    $("connection-status").textContent = message;
+  }
 
-c1, c2, c3 = st.columns(3)
+  function updateControls(connected) {
+    $("connect").disabled = connected;
+    $("disconnect").disabled = !connected;
+    ["arm", "disarm", "estop", "reset",
+     "set-output", "set-input", "digital-on",
+     "digital-off", "send-pwm"].forEach(id => {
+       $(id).disabled = !connected;
+    });
+  }
 
-c1.metric(
-    "USB",
-    "CONNECTED" if ser and ser.is_open else "OFFLINE"
+  async function send(command) {
+    if (!writer) {
+      log("NOT CONNECTED: " + command);
+      return;
+    }
+
+    writeQueue = writeQueue.then(async () => {
+      await writer.write(new TextEncoder().encode(command + "\n"));
+      log("> " + command);
+    });
+
+    return writeQueue;
+  }
+
+  function drawChart() {
+    const canvas = $("analog-chart");
+    const ctx = canvas.getContext("2d");
+    const w = canvas.width, h = canvas.height;
+    ctx.clearRect(0, 0, w, h);
+
+    ctx.strokeStyle = "#888";
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(35, 10);
+    ctx.lineTo(35, h - 25);
+    ctx.lineTo(w - 10, h - 25);
+    ctx.stroke();
+
+    const series = history.slice(-100);
+    if (series.length < 2) return;
+
+    for (let channel = 0; channel < 6; channel++) {
+      ctx.beginPath();
+      series.forEach((row, index) => {
+        const x = 35 + index * (w - 50) / 99;
+        const y = h - 25 - row.values[channel] * (h - 45) / 1023;
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      // Distinct line styles without requiring a colour palette.
+      ctx.setLineDash(channel % 2 ? [5, 3] : []);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+
+  function handleLine(line) {
+    if (!line) return;
+    log("< " + line);
+
+    if (line === "PONG") {
+      log("Arduino communication verified.");
+      return;
+    }
+
+    if (line.startsWith("DATA,")) {
+      const parts = line.split(",");
+      if (parts.length !== 8) return;
+
+      const values = parts.slice(2).map(Number);
+      if (values.some(v => !Number.isFinite(v))) return;
+
+      values.forEach((v, i) => {
+        $("a" + i).textContent = v;
+      });
+
+      history.push({
+        time: new Date().toISOString(),
+        values
+      });
+      if (history.length > 1000) history.shift();
+      drawChart();
+      return;
+    }
+
+    if (line.startsWith("STATUS,")) {
+      $("safety-status").textContent = line;
+    }
+
+    if (line.startsWith("FAULT,")) {
+      armed = false;
+      $("safety-status").textContent = line;
+      log("SAFETY EVENT: " + line);
+    }
+  }
+
+  async function readLoop() {
+    const decoder = new TextDecoder();
+
+    try {
+      while (port && port.readable) {
+        reader = port.readable.getReader();
+
+        try {
+          while (true) {
+            const {value, done} = await reader.read();
+            if (done) break;
+            lineBuffer += decoder.decode(value, {stream: true});
+
+            let newline;
+            while ((newline = lineBuffer.indexOf("\n")) >= 0) {
+              const line = lineBuffer.slice(0, newline).trim();
+              lineBuffer = lineBuffer.slice(newline + 1);
+              handleLine(line);
+            }
+          }
+        } finally {
+          reader.releaseLock();
+          reader = null;
+        }
+      }
+    } catch (err) {
+      log("Serial read error: " + err.message);
+    }
+  }
+
+  async function connect() {
+    if (!("serial" in navigator)) {
+      log("Web Serial is unavailable. Use Chrome or Edge on HTTPS.");
+      return;
+    }
+
+    try {
+      // Must be called directly from the Connect button click.
+      port = await navigator.serial.requestPort();
+      await port.open({baudRate: 115200});
+
+      writer = port.writable.getWriter();
+      updateControls(true);
+      setStatus("● Connected");
+      log("USB serial connected at 115200 baud.");
+
+      readTask = readLoop();
+
+      await send("PING");
+      await send("STATUS");
+      await send("STREAM,1,250");
+
+      heartbeatTimer = setInterval(() => {
+        if (armed) send("HB");
+      }, 500);
+
+    } catch (err) {
+      log("Connection failed: " + err.message);
+      await disconnect();
+    }
+  }
+
+  async function disconnect() {
+    armed = false;
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+
+    try {
+      if (writer) {
+        await writer.write(new TextEncoder().encode("DISARM\n"));
+        writer.releaseLock();
+        writer = null;
+      }
+    } catch (err) {
+      log("Could not send DISARM: " + err.message);
+    }
+
+    try {
+      if (reader) await reader.cancel();
+    } catch (_) {}
+
+    try {
+      if (port) await port.close();
+    } catch (err) {
+      log("Port close: " + err.message);
+    }
+
+    port = null;
+    reader = null;
+    updateControls(false);
+    setStatus("● Disconnected");
+    $("safety-status").textContent = "Disconnected. Outputs should be disarmed.";
+  }
+
+  $("connect").onclick = connect;
+  $("disconnect").onclick = disconnect;
+
+  $("arm").onclick = async () => {
+    if (estop) {
+      log("Reset E-STOP before arming.");
+      return;
+    }
+    await send("ARM");
+    armed = true;
+    $("safety-status").textContent = "ARM command sent. Check Arduino acknowledgement.";
+  };
+
+  $("disarm").onclick = async () => {
+    armed = false;
+    await send("DISARM");
+    $("safety-status").textContent = "Disarm command sent.";
+  };
+
+  $("estop").onclick = async () => {
+    armed = false;
+    estop = true;
+    await send("ESTOP");
+    $("safety-status").textContent = "EMERGENCY STOP command sent.";
+  };
+
+  $("reset").onclick = async () => {
+    await send("RESET");
+    estop = false;
+    $("safety-status").textContent = "Reset command sent. Verify board status before arming.";
+  };
+
+  $("set-output").onclick = () =>
+    send(`MODE,${$("digital-pin").value},OUT`);
+
+  $("set-input").onclick = () =>
+    send(`MODE,${$("digital-pin").value},IN`);
+
+  $("digital-on").onclick = () =>
+    send(`D,${$("digital-pin").value},1`);
+
+  $("digital-off").onclick = () =>
+    send(`D,${$("digital-pin").value},0`);
+
+  $("pwm-slider").oninput = () => {
+    $("pwm-value").textContent = $("pwm-slider").value;
+  };
+
+  $("send-pwm").onclick = () =>
+    send(`PWM,${$("pwm-pin").value},${$("pwm-slider").value}`);
+
+  $("download-csv").onclick = () => {
+    const rows = ["timestamp,A0,A1,A2,A3,A4,A5"];
+    history.forEach(row => {
+      rows.push([row.time, ...row.values].join(","));
+    });
+
+    const blob = new Blob([rows.join("\n")], {type: "text/csv"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "arduino_sensor_data.csv";
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  updateControls(false);
+
+  return () => {
+    clearInterval(heartbeatTimer);
+    if (reader) reader.cancel().catch(() => {});
+    if (writer) writer.releaseLock();
+    if (port) port.close().catch(() => {});
+  };
+}
+"""
+
+arduino_component = st.components.v2.component(
+    name="arduino_usb_controller",
+    html=HTML,
+    css=CSS,
+    js=JS,
 )
 
-c2.metric(
-    "OUTPUTS",
-    "ARMED" if st.session_state.armed else "DISARMED"
-)
-
-c3.metric(
-    "ESTOP",
-    "ACTIVE" if st.session_state.estop else "CLEAR"
-)
-
-a, b, c = st.columns(3)
-
-with a:
-    if st.button("ARM", disabled=not bool(ser)):
-        send("ARM")
-
-with b:
-    if st.button("DISARM", disabled=not bool(ser)):
-        send("DISARM")
-
-with c:
-    if st.button("EMERGENCY STOP", type="primary",
-                 disabled=not bool(ser)):
-        send("ESTOP")
-
-if st.button("RESET EMERGENCY STOP"):
-    send("RESET")
-
-
-# DIGITAL CONTROL
-st.divider()
-st.subheader("Digital Pin Control")
-
-pin = st.selectbox(
-    "Digital Pin",
-    list(range(2, 14))
-)
-
-mode = st.selectbox(
-    "Pin Mode",
-    ["IN", "OUT"]
-)
-
-if st.button("Configure Pin"):
-    if not st.session_state.armed:
-        send(f"MODE,{pin},{mode}")
-    else:
-        st.warning("Disarm before changing pin mode.")
-
-x, y = st.columns(2)
-
-with x:
-    if st.button("DIGITAL HIGH",
-                 disabled=not st.session_state.armed):
-        send(f"D,{pin},1")
-
-with y:
-    if st.button("DIGITAL LOW",
-                 disabled=not st.session_state.armed):
-        send(f"D,{pin},0")
-
-if st.button("READ DIGITAL"):
-    send(f"READ,{pin}")
-
-
-# PWM
-st.divider()
-st.subheader("PWM Control")
-
-pwm_pin = st.selectbox(
-    "PWM Pin",
-    [3, 5, 6, 9, 10, 11]
-)
-
-pwm_value = st.slider(
-    "PWM Value",
-    0, 255, 0
-)
-
-st.write(f"Duty command: {pwm_value / 255 * 100:.1f}%")
-
-if st.button("APPLY PWM",
-             disabled=not st.session_state.armed):
-    send(f"PWM,{pwm_pin},{pwm_value}")
-
-
-# DATA ACQUISITION
-st.divider()
-st.subheader("Automatic Analog Acquisition")
-
-interval = st.select_slider(
-    "Sampling interval (ms)",
-    options=[100, 200, 500, 1000, 2000, 5000],
-    value=200
-)
-
-x, y = st.columns(2)
-
-with x:
-    if st.button("START ACQUISITION"):
-        send(f"STREAM,1,{interval}")
-
-with y:
-    if st.button("STOP ACQUISITION"):
-        send("STREAM,0")
-
-
-# LIVE MONITOR
-@st.fragment(run_every=0.25)
-def live_monitor():
-
-    if not st.session_state.ser or not st.session_state.ser.is_open:
-        st.warning("Connect Arduino first.")
-        return
-
-    # Heartbeat
-    now = time.monotonic()
-
-    if st.session_state.armed:
-        if now - st.session_state.last_hb > 0.5:
-            if send("HB"):
-                st.session_state.last_hb = now
-
-    read_serial()
-
-    if st.session_state.records:
-
-        df = pd.DataFrame(st.session_state.records)
-        latest = df.iloc[-1]
-
-        cols = st.columns(6)
-
-        for i, col in enumerate(cols):
-            col.metric(f"A{i}", int(latest[f"A{i}"]))
-
-        channels = st.multiselect(
-            "Analog Channels",
-            [f"A{i}" for i in range(6)],
-            default=["A0", "A1"]
-        )
-
-        if channels:
-            fig = px.line(
-                df.tail(500),
-                x="Time_ms",
-                y=channels
-            )
-
-            st.plotly_chart(
-                fig,
-                use_container_width=True
-            )
-
-    st.subheader("Serial Communication Log")
-
-    for entry in st.session_state.logs[-15:]:
-        st.text(entry)
-
-
-live_monitor()
-
-
-# TERMINAL
-st.divider()
-st.subheader("Serial Terminal")
-
-terminal = st.text_input(
-    "Command",
-    placeholder="PING"
-)
-
-if st.button("SEND COMMAND"):
-
-    allowed = [
-        "PING", "STATUS", "ARM",
-        "DISARM", "ESTOP", "RESET",
-        "STREAM,0"
-    ]
-
-    if terminal.strip() in allowed:
-        send(terminal.strip())
-    else:
-        st.warning(
-            "Use the dashboard controls for pin commands. "
-            "Terminal currently accepts status and safety commands."
-        )
-
-
-# CSV
-st.divider()
-st.subheader("Experiment Data")
-
-if st.session_state.records:
-
-    df = pd.DataFrame(st.session_state.records)
-
-    st.download_button(
-        "DOWNLOAD CSV",
-        df.to_csv(index=False),
-        "arduino_data.csv",
-        "text/csv"
-    )
+arduino_component()

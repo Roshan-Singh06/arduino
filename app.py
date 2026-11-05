@@ -322,11 +322,27 @@ export default function({ parentElement }) {
       setStatus("● Connected");
       log("USB serial connected at 115200 baud.");
 
-      readTask = readLoop();
+      
+readTask = readLoop();
 
-      await send("PING");
-      await send("STATUS");
-      await send("STREAM,1,250");
+// Wait for Arduino Uno automatic reset to finish.
+log("Waiting for Arduino startup...");
+await new Promise(resolve => setTimeout(resolve, 2000));
+
+// Test communication.
+await send("PING");
+
+// Allow time for the response.
+await new Promise(resolve => setTimeout(resolve, 300));
+
+// Request board status.
+await send("STATUS");
+
+await new Promise(resolve => setTimeout(resolve, 300));
+
+// Start analog sensor streaming.
+await send("STREAM,1,250");
+
 
       heartbeatTimer = setInterval(() => {
         if (armed) send("HB");
